@@ -107,6 +107,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+scrapers/session.json
 env/
 venv/
 ENV/

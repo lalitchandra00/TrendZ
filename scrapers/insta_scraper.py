@@ -1,4 +1,5 @@
 import os
+import random
 import time
 from itertools import islice
 
@@ -24,17 +25,39 @@ media_folder = os.path.join(BASE_DIR, '..', 'datasets', 'general_caption', 'Medi
 captions_path = os.path.join(BASE_DIR, '..', 'datasets', 'general_caption', 'captions.txt')
 os.makedirs(media_folder, exist_ok=True)
 
+RATE_LIMIT_BACKOFF = [30, 60, 120, 300]
 
-def with_retry(fn, retries=3, delay=15):
+
+def _is_rate_limited(exc):
+    msg = str(exc).lower()
+    return (
+        "401 unauthorized" in msg
+        or "429" in msg
+        or "please wait a few minutes" in msg
+        or "too many request" in msg
+    )
+
+
+def with_retry(fn, retries=4, base_delay=30):
     for attempt in range(1, retries + 1):
         try:
             return fn()
         except (ConnectionException, requests.RequestException) as exc:
             if attempt == retries:
                 raise
-            print(f"Request failed ({exc}); retrying in {delay * attempt}s...")
-            time.sleep(delay * attempt)
+            if _is_rate_limited(exc):
+                delay = RATE_LIMIT_BACKOFF[min(attempt - 1, len(RATE_LIMIT_BACKOFF) - 1)]
+                delay += random.randint(0, 30)
+                print(f"Rate-limited ({exc}); waiting {delay}s before retry {attempt + 1}/{retries}...")
+            else:
+                delay = base_delay * attempt + random.randint(0, 15)
+                print(f"Request failed ({exc}); retrying in {delay}s...")
+            time.sleep(delay)
     raise RuntimeError("Retry operation did not complete")
+
+
+def _random_delay(low=3, high=8):
+    time.sleep(random.uniform(low, high))
 
 
 def download_file(url, path):
@@ -87,9 +110,11 @@ def login(loader):
     try:
         if os.path.exists(session_file):
             loader.load_session_from_file(username, session_file)
+            print(f"Loaded saved session for @{username}.")
         else:
-            with_retry(lambda: loader.login(username, password), retries=2, delay=10)
+            with_retry(lambda: loader.login(username, password), retries=2, base_delay=10)
             loader.save_session_to_file(session_file)
+            print(f"Logged in as @{username} and saved session.")
     except InstaloaderException as exc:
         reason = "Instagram requested a login checkpoint" if "checkpoint" in str(exc).lower() else "Instagram rejected the login"
         print(
@@ -99,11 +124,20 @@ def login(loader):
 
 
 def scrape():
-    loader = Instaloader(max_connection_attempts=3, request_timeout=60)
+    loader = Instaloader(
+        max_connection_attempts=3,
+        request_timeout=60,
+        sleep=False,
+    )
     login(loader)
     rows = []
-    for username in PROFILES:
+    for idx, username in enumerate(PROFILES):
+        if idx > 0:
+            delay = random.randint(30, 90)
+            print(f"Throttling {delay}s before next profile...")
+            time.sleep(delay)
         print(f"Scraping @{username}...")
+        _random_delay(5, 15)
         profile = with_retry(lambda: Profile.from_username(loader.context, username))
         for post in islice(profile.get_posts(), MAX_POSTS):
             if (post.likes or 0) < MIN_LIKES:
@@ -116,7 +150,7 @@ def scrape():
                     "hashtags": " ".join(post.caption_hashtags),
                     "post_type": get_post_type(post.typename),
                 })
-            time.sleep(2)
+            _random_delay(2, 5)
     return rows
 
 
@@ -138,15 +172,9 @@ def main():
     try:
         save_rows(scrape())
     except (ConnectionException, requests.RequestException) as exc:
-        message = str(exc).lower()
-        if (
-            "429" in message
-            or "401 unauthorized" in message
-            or "too many request" in message
-            or "please wait a few minutes" in message
-        ):
-            print("Instagram rate-limited this connection. Wait before retrying.")
-        elif "getaddrinfo" in message or "failed to resolve" in message:
+        if _is_rate_limited(exc):
+            print("Instagram rate-limited this connection. Wait 10-15 minutes before retrying.")
+        elif "getaddrinfo" in str(exc).lower() or "failed to resolve" in str(exc).lower():
             print("DNS failed for Instagram. Check your internet connection, VPN, or DNS settings.")
         else:
             print(f"Instagram connection error: {exc}")
